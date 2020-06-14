@@ -1,0 +1,432 @@
+---
+title: "Análisis de datos Ómicos"
+author: "Albert Moreno Mingorance"
+date: "14 de junio de 2020"
+output:
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+##Abstract
+
+Se realiza un análisis de RNA-Seq para determinar la implicación de genes en los procesos de regulación génica en la tiroides. Se analizan los datos obtenidos de un experimento de RNA-Seq con muestras de ARN en tejido de tiroides con tres condiciones diferentes: Tejido no infiltrado (NTI), Pequeñas  infiltraciones focalizadas (SFI) e Infiltraciones extensivas linfoides (ELI). Los resultados permitieron identificar genes cuyos niveles de expresión variaban según el tratamiento aplicado. 
+
+En el siguiente link https://github.com/Amorenomin/ADO_PEC2 se puede encontrar el archivo .rmd que se ha utilizado para generar este estudio.
+
+##Objetivos
+
+El trabajo tiene por objetivo principal estudiar el efecto que se produce en el transcriptoma tras la aplicación de infiltraciones en el tejido de la tiroides. 
+
+##Materiales y Métodos/Resultados
+
+En este apartado se expondrán tanto el procedimiento general que se utilizará para el desarrollo del análisis de los datos como los resultados que se observen en cada uno de los pasos del análisis de RNA-Seq:
+
+##1.Instalación de paquetes
+
+Empezaremos con la instalación de todos aquellos paquetes que necesitaremos para llevar a cabo el análisis de los datos procedentes del experimento de RNA-Seq.
+
+```{r echo=FALSE, message=FALSE}
+if(!require(BiocManager)) install.packages("BiocManager")
+if(!require(reshape)) install.packages("reshape")
+if(!require(DESeq2)) BiocManager::install("DESeq2")
+if(!require(ggplot2)) install.packages("ggplot2", dep=TRUE)
+if(!require(DESeq)) BiocManager::install("DESeq")
+if(!require(pheatmap)) install.packages("pheatmap", dep=TRUE)
+if(!require(RColorBrewer)) install.packages("RColorBrewer", dep=TRUE)
+if (!requireNamespace("edgeR", quietly = TRUE)) {BiocManager::install("edgeR")}
+if(!require(dplyr)) install.packages("dplyr", dep=TRUE)
+if(!require(genefilter)) BiocManager::install("genefilter")
+if(!require(org.Hs.eg.db)) BiocManager::install("org.Hs.eg.db")
+if(!require(AnnotationDbi)) BiocManager::install("AnnotationDbi")
+if(!require(ggbeeswarm)) install.packages("ggbeeswarm", dep=TRUE)
+if(!require(BiocParallel)) BiocManager::install("reactome.db")
+```
+```{r echo=FALSE, message=FALSE}
+setwd("C:/Users/usuario/Documents/IMPORTANTE/Master_bioinformatica_bioestadistica/Analisi de dades omiques/pec2")
+```
+
+## 2. Datos
+Los datos utilizados en el presente trabajo fueron obtenidos del repositorio (GTEx1). Este repositorio contiene datos de múltiples tipos en un total de 54 tejidos. Nosotros nos centraremos en los datos de expresión (RNA-seq) pertenecientes a un análisis del tiroides en donde se compara tres tipos de infiltración medido en un total de 292 muestras pertenecientes a tres grupos:
+• Not infiltrated tissues (NIT): 236 samples
+• Small focal infiltrates (SFI): 42 samples
+• Extensive lymphoid infiltrates (ELI): 14 samples.
+
+Mediante el siguiente script se seleccionaran aleatoriamente 10 muestras de cada grupo para llevar acabo el análisis. 
+
+```{r}
+set.seed(14532)
+targets <- read.csv2("data/targets.csv", header = TRUE, sep = ",")
+countsdata <- read.csv2("data/counts.csv", header = TRUE,row.names = 1, sep = ";")
+targets_NIT<-subset(targets, Group == "NIT")
+targets_SFI<-subset(targets, Group == "SFI")
+targets_ELI<-subset(targets, Group == "ELI")
+sample_size = 10
+sample_NIT = targets_NIT[sample(nrow(targets_NIT), sample_size, replace = FALSE), ]
+sample_SFI = targets_SFI[sample(nrow(targets_SFI), sample_size, replace = FALSE), ]
+sample_ELI = targets_ELI[sample(nrow(targets_ELI), sample_size, replace = FALSE), ]
+subset_targets <- rbind(sample_NIT, sample_SFI,sample_ELI)
+```
+
+Así mismo también se cambiará el nombre de las muestras por la versión corta y eliminaremos una parte del nombre de los genes estudiados. 
+
+```{r}
+vector_names<-subset_targets$Sample_Name
+subset_counts<-countsdata[,vector_names]
+vector_shortnames<-subset_targets$ShortName
+colnames(subset_counts)= paste0(vector_shortnames)
+rownames(subset_counts)<-gsub("\\..*", "", rownames(subset_counts), fixed = FALSE)
+```
+__DESeqDataSet object__
+
+Nuestro objetivo es utilizar el paquete DESeq2 para llevar acabo el análisis, por lo que es necesario añadir todos los datos importados en DESeqDataSet object. Además le vamos a especificar las condiciones experimentales en nuestro caso el tratamiento y el sexo.
+
+```{r}
+library("DESeq2")
+dds <- DESeqDataSetFromMatrix(countData = subset_counts, colData=subset_targets, design = ~ Group + sex)
+dds
+```
+
+## 3. *Workflow*
+
+##3.1 Análisis exploratorio and visualización
+El estudio de la calidad y la exploración de los datos son pasos esenciales en cualquier análisis de datos y se recomienda realizarlos inicialmente.
+El objetivo es detectar posibles anormalidades que puedan influir en los posteriores análisis. 
+
+__3.1.1 Pre-filtering the dataset__
+
+La matriz de *counts* contiene muchas filas con 0 o pocos fragmentos. Con el objetivo de reducir el tamaño de DESeqDataSet y incrementar la velocidad de análisis, se eliminaran aquellas filas que no aparten información o esta sea muy baja. 
+
+```{r}
+nrow(dds)
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+nrow(dds)
+```
+
+Después del filtrado observamos que se han eliminado 12412 genes, y se mantienen 43790
+
+__3.1.2 The variance stabilizing transformation __
+
+Es necesario realizar una transformación de los *counts* para estabilizar la varianza. En este caso utilizamos la función VST que se encuentra  en el paquete DESeq2, ya que es la recomendada para *datasets* de más de 30 muestras y es menos sensible a *outliers*. 
+Se especifica blind = FALSE, ya que se espera que las variables del experimento, no influyan en la tendencia varianza-promedio, en este caso el tratamiento y el sexo. 
+
+```{r}
+vsd <- vst(dds, blind = FALSE)
+```
+
+A continuación comprobaremos  el resultado de la transformación, comparándolo con el log2 de los datos iniciales normalizados. 
+
+```{r message=FALSE, warning=FALSE}
+library("dplyr")
+library("ggplot2")
+
+dds <- estimateSizeFactors(dds)
+
+df <- bind_rows(
+  as_data_frame(log2(counts(dds, normalized=TRUE)[, 1:2]+1)) %>%
+         mutate(transformation = "log2(x + 1)"),
+  as_data_frame(assay(vsd)[, 1:2]) %>% mutate(transformation = "vst"))
+colnames(df)[1:2] <- c("x", "y")  
+
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+```
+
+Podemos observar que los genes con pocos *counts*, presentan una gran variabilidad en el gráfico logarítmico, en cambio en VST se han comprimido las diferencias ya que los datos aportan poca información relativa a su expresión diferencial.
+
+__3.1.3 Samples distances__
+
+Seguidamente procederemos a analizar la similaridad de las muestras. Para ello realizaremos un *heatmap* mediante una matriz de distancias. 
+
+```{r}
+sampleDists <- dist(t(assay(vsd)))
+
+library("pheatmap")
+library("RColorBrewer")
+
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( vsd$ShortName, vsd$sex, sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+```
+
+No se observan agrupaciones claras por grupos, aunque las muestras que mejor se agrupan son las ELI. 
+
+__3.1.4 PCA plot__
+
+En la misma línea de analizar la similaridad que en el anterior apartado, es útil realzar un análisis de componente principal. 
+
+```{r}
+DESeq2::plotPCA(vsd, intgroup = c("Group", "sex"))
+```
+
+En este análisis podemos observar una agrupación opuesta y diferenciada por tratamiento y sexo en el caso de NIT y ELI. En cambio los datos de SFI se encuentran más al medio y las mujeres se aproximan más a los datos de mujeres ELI y por el contrario los de hombres se aproximan más a los de NIT. 
+
+##3.2 Análisis de expresión diferencial
+
+__3.2.1 DESeq __
+
+Una vez explorados los datos, procedemos a realizar el análisis de expresión diferencial mediante la función DESeq.
+```{r message=FALSE}
+dds <- DESeq(dds, parallel =TRUE)
+```
+
+Un DESeqDataSet es generado con los parámetros ajustados.
+
+__3.2.2 Extracción de resultados__
+
+A partir del DESeqDataSet extraemos los resultados referentes en primer lugar a la expresión diferencial entre los grupos NIT y ELI. 
+
+Para evitar el problema que supone la realización de test múltiples y la posibilidad de falsos positivos, el paquete DESeq2 realiza un ajuste de  Benjamini-Hochberg  (BH) que calcula un p-value ajustado  tiendo en cuenta el porcentaje que posibles falsos positivos. Consideraremos una fracción del 10% de falsos positivos como aceptable.
+
+```{r message=FALSE}
+res_NE <- results(dds, contrast=c("Group","NIT","ELI"))
+summary(res_NE)
+sum(res_NE$padj < 0.1, na.rm=TRUE)
+```
+Observamos que 1217 se encuentran sobre-expresados (2.8%) y el 3116 (7,1%) infra-expresados. En total 4333 genes.
+A continuación de la expresión diferencial entre NIT y SFI.
+```{r message=FALSE}
+res_NS <- results(dds, contrast=c("Group","NIT","SFI"))
+summary(res_NS)
+sum(res_NS$padj < 0.1, na.rm=TRUE)
+```
+En este caso, número total de genes diferencialmente expresado en bastante menor de 243, mayoritariamente infra-expresados(220).
+ 
+Seguidamente observaremos aquellos genes que presentan un *down-regulation* significativamente más elevada para NIT vs ELI.
+```{r}
+resSigNE <- subset(res_NE, padj < 0.1)
+head<- as.data.frame(head(resSigNE[ order(resSigNE$log2FoldChange), ]))
+print(head, digits = 4)
+```
+y para NIT vs SFI
+
+```{r}
+resSigNS <- subset(res_NS, padj < 0.1)
+head<- as.data.frame(head(resSigNS[ order(resSigNS$log2FoldChange), ]))
+print(head, digits = 4)
+```
+Tambíen observaremos aquellos que presetan un *up-regulation* mayor:
+```{r}
+head<- as.data.frame(head(resSigNE[ order(resSigNE$log2FoldChange, decreasing = TRUE), ]))
+print(head, digits = 4)
+```
+
+```{r}
+head<- as.data.frame(head(resSigNS[ order(resSigNS$log2FoldChange, decreasing = TRUE), ]))
+print(head, digits = 4)
+```
+
+
+##3.3 Plotting results
+
+__3.3.1 Counts plot__
+
+Podemos ver el gen con más diferencia representado gráficamente. 
+
+```{r}
+topGeneNE <- rownames(res_NE)[which.min(res_NE$padj)]
+topGeneNE 
+library("ggbeeswarm")
+
+geneCounts <- plotCounts(dds, gene = topGeneNE, intgroup = c("Group","sex"),
+                         returnData = TRUE)
+ggplot(geneCounts, aes(x = Group, y = count, color = sex, group = sex)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+```
+
+En este caso podemos ver como el gen ENSG00000211895 es el que presenta un p-adj más elevado y se encuentra sobre expresado en ELI e infra-expresado en NIT.
+
+```{r}
+topGeneNS <- rownames(res_NS)[which.min(res_NS$padj)]
+topGeneNS
+
+geneCounts <- plotCounts(dds, gene = topGeneNS, intgroup = c("Group","sex"),
+                         returnData = TRUE)
+ggplot(geneCounts, aes(x = Group, y = count, color = sex, group = sex)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+```
+
+En este caso el gen ENSG00000211959 es el más significativo para NIT vs SFI, aunque podemos observar que no hay una diferencia tan clara como en el anterior gráfico.
+
+
+__3.3.2 Gene clustering__
+
+En el dendograma anterior hemos comparado la distancia entre muestras. Ahora compararemos los 20 genes que presentan más variabilidad.
+
+```{r}
+library("genefilter")
+topVarGenes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 20)
+
+mat  <- assay(vsd)[topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(vsd)[, c("Group","sex")])
+pheatmap(mat, annotation_col = anno)
+```
+
+Podemos ver cómo los 6 primeros genes presentan una diferencia asociada al sexo, y el resto más asociada al tratamiento,  remarcado la mayor diferencia entre ELI y NIT. 
+
+##3.4 Anotación y exportación de resultados 
+
+Utilizaremos el paquete org.Mm.eg.db para incluir la información de anotación que nos interese a los genes.
+
+```{r}
+library("AnnotationDbi")
+library(org.Hs.eg.db)
+```
+
+Con la función *mapIds* añadiremos la información del símbolo del gen y el *Entrez ID* a los resultados utilizando el número ENSEMBL como referencia en la base de datos. 
+
+```{r}
+res_NE$symbol <- mapIds(org.Hs.eg.db,
+                     keys=row.names(res_NE),
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+res_NS$symbol <- mapIds(org.Hs.eg.db,
+                     keys=row.names(res_NS),
+                     column="SYMBOL",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+```
+
+```{r}
+res_NE$entrez <- mapIds(org.Hs.eg.db,
+                     keys=row.names(res_NE),
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+res_NS$entrez <- mapIds(org.Hs.eg.db,
+                     keys=row.names(res_NS),
+                     column="ENTREZID",
+                     keytype="ENSEMBL",
+                     multiVals="first")
+```
+
+A continuación ordenaremos los resultados por p valor y los exportaremos en tablas. 
+
+```{r}
+resOrderedNE <- res_NE[order(res_NE$pvalue),]
+resOrderedNS <- res_NS[order(res_NS$pvalue),]
+resOrdered_NE_DF <- as.data.frame(resOrderedNE)
+resOrdered_NS_DF <- as.data.frame(resOrderedNS)
+write.csv(resOrdered_NE_DF, file = "resultsNE.csv")
+write.csv(resOrdered_NS_DF, file = "resultsNS.csv")
+```
+
+##3.5 Análisis de significación biológica ("Gene Enrichment Analysis")
+
+En este apartado realizaremos un análisis mediante la base de datos *Reactome*  con el fin de proporcionar información sobre qué vías biológicas o redes de genes están implicados los genes analizados.
+
+```{r}
+library( "reactome.db" )
+```
+Empezaremos estudiado los resultados de comparación NIT vs ELI. 
+
+La base de datos utiliza el *Entrez ID* que hemos añadido en el apartado anterior. En primer lugar seleccionaremos aquellos genes por los que exista información en la base de datos y el p-adj no sea NA. 
+
+
+```{r}
+resNE2 <- res_NE[ res_NE$entrez %in% keys( reactome.db, "ENTREZID" ) &!is.na( res_NE$padj ) , ]
+```
+
+Con la funcion *select* del paquete *AnnotationDb* obtemos una tabla con el *Entrez ID* y el *Reactome Path ID*.
+
+```{r}
+reactomeTableNE <- AnnotationDbi::select( reactome.db,keys=as.character(resNE2$entrez), keytype="ENTREZID",columns=c("ENTREZID","REACTOMEID") )
+head(reactomeTableNE)
+```
+
+Seguidamente agruparemos los genes por *Reactome Path ID*.  Eliminaremos aquellas vías que contengan menos de 20 genes o más de 80. 
+
+```{r}
+incm <- do.call( rbind, with(reactomeTableNE, tapply(ENTREZID, factor(REACTOMEID), function(x) resNE2$entrez %in% x ) ))
+colnames(incm) <- resNE2$entrez
+within <- function(x, lower, upper) (x>=lower & x<=upper)
+incm <- incm[ within(rowSums(incm), lower=20, upper=80), ]
+```
+
+Para evaluar si los genes en un *Reactome Path* se comportan de manera especial en nuestro experimento, realizaremos algunos cálculos estadísticos mediante una función auxiliar. 
+
+```{r}
+testCategory <- function( reactomeID ){
+  isMember <- incm[ reactomeID,]
+  data.frame(
+    reactomeID  = reactomeID,
+    numGenes    = sum( isMember ),
+    avgLFC      = mean( resNE2$log2FoldChange[isMember] ),
+    sdLFC       = sd( resNE2$log2FoldChange[isMember] ),
+    zValue      = mean( resNE2$log2FoldChange[isMember] ) /sd( resNE2$log2FoldChange[isMember] ),
+    strength    = sum( resNE2$log2FoldChange[isMember] ) / sqrt(sum(isMember)),
+    pvalue      = t.test( resNE2$log2FoldChange[ isMember ] )$p.value,
+    reactomeName = reactomePATHID2NAME[[reactomeID]],
+    stringsAsFactors = FALSE )}
+reactomeResult <- do.call( rbind, lapply( rownames(incm), testCategory ) )
+```
+
+
+Como se han realizado test múltiples, realizaremos un ajuste mediante BH.
+```{r}
+reactomeResult$padjust <- p.adjust( reactomeResult$pvalue, "BH" )
+```
+
+Finalmente obtenemos una lista de las *Reactome Path* significativamente diferencialmente expresadas.
+
+```{r}
+reactomeResultSignif <- reactomeResult[ reactomeResult$padjust < 0.05, ]
+head<- as.data.frame(head( reactomeResultSignif[ order(-reactomeResultSignif$strength), ] ))
+print(head,digits = 4)
+```
+Podemos observar que algunas de las vías significativamente diferencialmente expresadas entre NIT y ELI son *Intraflagellar transport, Smooth Muscle Contraction, Elastic fibre formation, Molecules associated with elastic fibres*, etc. 
+
+A continuación realizaremos el mismo proceso para la comparación NIT vs SFI.
+
+```{r }
+resNS2 <- res_NS[ res_NS$entrez %in% keys( reactome.db, "ENTREZID" ) &!is.na( res_NS$padj ) , ]
+```
+```{r}
+reactomeTableNS <- AnnotationDbi::select( reactome.db,keys=as.character(resNS2$entrez), keytype="ENTREZID",columns=c("ENTREZID","REACTOMEID") )
+```
+```{r }
+incm <- do.call( rbind, with(reactomeTableNS, tapply(ENTREZID, factor(REACTOMEID), function(x) resNS2$entrez %in% x ) ))
+colnames(incm) <- resNS2$entrez
+```
+```{r }
+within <- function(x, lower, upper) (x>=lower & x<=upper)
+incm <- incm[ within(rowSums(incm), lower=20, upper=80), ]
+```
+```{r include=FALSE}
+testCategory <- function( reactomeID ){
+  isMember <- incm[ reactomeID,]
+  data.frame(
+    reactomeID  = reactomeID,
+    numGenes    = sum( isMember ),
+    avgLFC      = mean( resNS2$log2FoldChange[isMember] ),
+    sdLFC       = sd( resNS2$log2FoldChange[isMember] ),
+    zValue      = mean( resNS2$log2FoldChange[isMember] ) /sd( resNS2$log2FoldChange[isMember] ),
+    strength    = sum( resNS2$log2FoldChange[isMember] ) / sqrt(sum(isMember)),
+    pvalue      = t.test( resNS2$log2FoldChange[ isMember ] )$p.value,
+    reactomeName = reactomePATHID2NAME[[reactomeID]],
+    stringsAsFactors = FALSE )}
+reactomeResult <- do.call( rbind, lapply( rownames(incm), testCategory ) )
+reactomeResult$padjust <- p.adjust( reactomeResult$pvalue, "BH" )
+```
+```{r }
+reactomeResultSignif <- reactomeResult[ reactomeResult$padjust < 0.05, ]
+head<- as.data.frame(head( reactomeResultSignif[ order(-reactomeResultSignif$strength), ] ))
+print(head,digits = 4)
+```
+ 
+En este caso encontramos vias metabolicas como *RNA Polymerase III Transcription, RNA Polymerase III Abortive And Retractive Initiation,Citric acid cycle (TCA cycle)*, etc.
+
+##4. Discusión.
+
+La principal limitación del análisis de RNA-Seq realizado ha sido la falta de información del experimento a analizar. Esta falta de información ha limitado la capacidad crítica con los resultados obtenidos,  siendo más relevante en  la existencia de diferencias sexuales, sobretodo en SFI. Quizá este tratamiento pueda tener efecto diferente en diferentes sexos, lo cual sería interesante de contrastar. 
